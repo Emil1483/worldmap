@@ -23,6 +23,8 @@ import re
 import sys
 
 import numpy as np
+from shapely.geometry import LineString, Polygon as ShapelyPolygon
+from shapely.ops import unary_union
 
 from worldmap_clean import parse_subpaths   # shared path parser
 
@@ -30,47 +32,6 @@ from worldmap_clean import parse_subpaths   # shared path parser
 def fmt(v):
     s = f'{v:.2f}'.rstrip('0').rstrip('.')
     return s if s not in ('', '-0') else '0'
-
-
-# ---- Sutherland-Hodgman polygon clip against an axis-aligned rectangle ------
-
-def clip_poly(pts, xmin, ymin, xmax, ymax):
-    """Clip closed polygon `pts` (list of (x,y)) to the rectangle. Returns a
-    list of (x,y) for the clipped polygon, or [] if nothing is inside."""
-    def clip_edge(poly, inside, intersect):
-        if not poly:
-            return poly
-        out = []
-        prev = poly[-1]
-        prev_in = inside(prev)
-        for cur in poly:
-            cur_in = inside(cur)
-            if cur_in:
-                if not prev_in:
-                    out.append(intersect(prev, cur))
-                out.append(cur)
-            elif prev_in:
-                out.append(intersect(prev, cur))
-            prev, prev_in = cur, cur_in
-        return out
-
-    def isect(p, q, t):
-        return (p[0] + (q[0] - p[0]) * t, p[1] + (q[1] - p[1]) * t)
-
-    poly = list(pts)
-    # left
-    poly = clip_edge(poly, lambda p: p[0] >= xmin,
-                     lambda p, q: isect(p, q, (xmin - p[0]) / (q[0] - p[0])))
-    # right
-    poly = clip_edge(poly, lambda p: p[0] <= xmax,
-                     lambda p, q: isect(p, q, (xmax - p[0]) / (q[0] - p[0])))
-    # top
-    poly = clip_edge(poly, lambda p: p[1] >= ymin,
-                     lambda p, q: isect(p, q, (ymin - p[1]) / (q[1] - p[1])))
-    # bottom
-    poly = clip_edge(poly, lambda p: p[1] <= ymax,
-                     lambda p, q: isect(p, q, (ymax - p[1]) / (q[1] - p[1])))
-    return poly
 
 
 def choose_grid(n, pw, ph, map_aspect):
@@ -107,6 +68,10 @@ def main():
     ap.add_argument('--align-horizontal', type=float, default=0.5,
                     help='0-1 horizontal placement of the map in spare width '
                          '(0 = flush left, 1 = flush right, 0.5 = centred)')
+    ap.add_argument('--small-island-cm2', type=float, default=5.0,
+                    help='a land island below this area that a seam would split '
+                         'is kept whole on the piece holding its centre (cut '
+                         'overhangs the edge) and dropped from the other piece')
     ap.add_argument('--border', action='store_true',
                     help='draw each piece outline rectangle (cut/registration)')
     ap.add_argument('--label', action='store_true',
@@ -150,72 +115,157 @@ def main():
     off_y = (total_h - draw_h) / 2.0          # vertical: always centred
 
     def to_grid(p):                            # source px -> grid mm
-        return ((p[:, 0] - mnx) * scale + off_x,
-                (p[:, 1] - mny) * scale + off_y)
+        return np.column_stack(((p[:, 0] - mnx) * scale + off_x,
+                                (p[:, 1] - mny) * scale + off_y))
 
-    grid_polys = []
-    for p in polys:
-        gx, gy = to_grid(p)
-        grid_polys.append(list(zip(gx.tolist(), gy.tolist())))
+    # Build the land as a shapely geometry in grid-mm space: union the land
+    # polygons, subtract the lakes (so holes stay holes). buffer(0) repairs the
+    # self-touching rings the source is full of.
+    land_parts, lake_parts = [], []
+    for s, p in zip(subs, polys):
+        poly = ShapelyPolygon(to_grid(p)).buffer(0)
+        (land_parts if s['area'] < 0 else lake_parts).append(poly)
+    land = unary_union(land_parts)
+    if lake_parts:
+        land = land.difference(unary_union(lake_parts))
 
     os.makedirs(args.outdir, exist_ok=True)
+
+    # Split the land at the seams into per-piece connected lobes. A lobe that is
+    # small (< --small-island-cm2) and is NOT its landmass's biggest fragment is
+    # an island the cut would orphan: move it WHOLE to the neighbouring piece
+    # that holds the body it was attached to (overhang past the edge — sheet is
+    # oversized), and drop it here. Big landmasses still split at the seam.
+    thr = args.small_island_cm2 * 100.0       # mm^2
+    box = {}
+    for r in range(rows):
+        for c in range(cols):
+            box[(r, c)] = ShapelyPolygon([(c * pw, r * ph), ((c + 1) * pw, r * ph),
+                                          ((c + 1) * pw, (r + 1) * ph),
+                                          (c * pw, (r + 1) * ph)])
+
+    def polygons(g):
+        if g.is_empty:
+            return []
+        if g.geom_type == 'Polygon':
+            return [g]
+        return [p for p in g.geoms if p.geom_type == 'Polygon']
+
+    keep = {(r, c): [] for r in range(rows) for c in range(cols)}
+    moved_lobes = []                          # islands kept whole (cut detours here)
+    n_moved = 0
+    for mass in polygons(land):               # each connected landmass
+        frag = {rc: mass.intersection(b) for rc, b in box.items()}
+        frag = {rc: g for rc, g in frag.items() if not g.is_empty}
+        body_rc = max(frag, key=lambda rc: frag[rc].area)
+        for rc, g in frag.items():
+            r, c = rc
+            for lobe in polygons(g):
+                # neighbours this lobe reaches across an interior seam
+                minx, miny, maxx, maxy = lobe.bounds
+                nbrs = []
+                if c > 0 and minx <= c * pw + 1e-6:
+                    nbrs.append((r, c - 1))
+                if c < cols - 1 and maxx >= (c + 1) * pw - 1e-6:
+                    nbrs.append((r, c + 1))
+                if r > 0 and miny <= r * ph + 1e-6:
+                    nbrs.append((r - 1, c))
+                if r < rows - 1 and maxy >= (r + 1) * ph - 1e-6:
+                    nbrs.append((r + 1, c))
+                orphan = (lobe.area < thr and rc != body_rc and nbrs and
+                          lobe.area < mass.area)
+                if orphan:                    # hand to the biggest adjacent piece
+                    owner = max(nbrs, key=lambda n: frag.get(n, lobe).area
+                                if n in frag else 0.0)
+                    keep[owner].append(lobe)
+                    moved_lobes.append(lobe)
+                    n_moved += 1
+                else:
+                    keep[rc].append(lobe)
 
     coverage = scale * scale * map_w * map_h / (cols * rows * pw * ph)
     print(f'map aspect {map_aspect:.3f} -> grid {cols}x{rows} of '
           f'{pw/10:.0f}x{ph/10:.0f}cm  (scale {scale:.4f}, '
-          f'wood used {coverage*100:.0f}%)')
+          f'wood used {coverage*100:.0f}%)'
+          + (f', {n_moved} small island(s) kept whole + overcut' if n_moved else ''))
+
+    def ring_d(coords, x0, y0):
+        pts = list(coords)
+        seg = ['M', fmt(pts[0][0] - x0), fmt(pts[0][1] - y0), 'L']
+        for x, y in pts[1:]:
+            seg.append(fmt(x - x0))
+            seg.append(fmt(y - y0))
+        seg.append('Z')
+        return ' '.join(seg)
+
+    def geom_d(g, x0, y0):                     # (multi)polygon -> SVG path data
+        parts = []
+        for poly in polygons(g):
+            parts.append(ring_d(poly.exterior.coords, x0, y0))
+            for hole in poly.interiors:
+                parts.append(ring_d(hole.coords, x0, y0))
+        return ''.join(parts)
 
     for r in range(rows):
         for c in range(cols):
             x0, y0 = c * pw, r * ph
-            x1, y1 = x0 + pw, y0 + ph
-            parts = []
-            for poly in grid_polys:
-                xs = [q[0] for q in poly]
-                ys = [q[1] for q in poly]
-                if max(xs) < x0 or min(xs) > x1 or max(ys) < y0 or min(ys) > y1:
-                    continue                   # bbox reject
-                cp = clip_poly(poly, x0, y0, x1, y1)
-                if len(cp) < 3:
-                    continue
-                seg = ['M', fmt(cp[0][0] - x0), fmt(cp[0][1] - y0), 'L']
-                for q in cp[1:]:
-                    seg.append(fmt(q[0] - x0))
-                    seg.append(fmt(q[1] - y0))
-                seg.append('Z')
-                parts.append(' '.join(seg))
-
+            # union the kept lobes so an orphan merges with its body (no re-cut)
+            g = unary_union(keep[(r, c)]) if keep[(r, c)] else None
+            d = geom_d(g, x0, y0) if g is not None and not g.is_empty else ''
+            # canvas grows to include any overhang past the nominal piece edge
+            if d:
+                gx0, gy0, gx1, gy1 = g.bounds
+                vx0, vy0 = min(0.0, gx0 - x0), min(0.0, gy0 - y0)
+                vx1, vy1 = max(pw, gx1 - x0), max(ph, gy1 - y0)
+            else:
+                vx0, vy0, vx1, vy1 = 0.0, 0.0, pw, ph
             body = ''
-            if parts:
-                body += f'<path fill="{fill}" fill-rule="nonzero" d="{"".join(parts)}"/>'
+            if d:
+                body += f'<path fill="{fill}" fill-rule="evenodd" d="{d}"/>'
             if args.border:
                 body += (f'<rect x="0" y="0" width="{fmt(pw)}" height="{fmt(ph)}" '
                          f'fill="none" stroke="#f00" stroke-width="0.5"/>')
             if args.label:
                 body += (f'<text x="6" y="20" font-size="14" '
                          f'fill="#00f">r{r+1}c{c+1}</text>')
-
             out = (f'<svg xmlns="http://www.w3.org/2000/svg" '
-                   f'width="{fmt(pw)}mm" height="{fmt(ph)}mm" '
-                   f'viewBox="0 0 {fmt(pw)} {fmt(ph)}" version="1.0">{body}</svg>')
+                   f'width="{fmt(vx1 - vx0)}mm" height="{fmt(vy1 - vy0)}mm" '
+                   f'viewBox="{fmt(vx0)} {fmt(vy0)} {fmt(vx1 - vx0)} {fmt(vy1 - vy0)}" '
+                   f'version="1.0">{body}</svg>')
             path = os.path.join(args.outdir, f'piece_r{r+1}_c{c+1}.svg')
             with open(path, 'w', encoding='utf-8') as f:
                 f.write(out)
 
-    # assembly overview: full map + grid lines + labels, in grid-mm space
+    # assembly overview: full map + the ACTUAL cut lines + labels. The red cut
+    # follows each seam, but breaks where a kept-whole island crosses it and
+    # detours along that island's coastline (so the island stays on one piece).
+    moved = unary_union(moved_lobes) if moved_lobes else None
+    seam_lines = ([LineString([(c * pw, 0), (c * pw, total_h)]) for c in range(1, cols)] +
+                  [LineString([(0, r * ph), (total_w, r * ph)]) for r in range(1, rows)])
+    all_seams = unary_union(seam_lines) if seam_lines else None
+
+    def line_svg(geom):
+        out = []
+        for ls in (geom.geoms if geom.geom_type.startswith('Multi') else [geom]):
+            if ls.geom_type != 'LineString' or ls.is_empty:
+                continue
+            pts = ' '.join(f'{fmt(x)},{fmt(y)}' for x, y in ls.coords)
+            out.append(f'<polyline points="{pts}" fill="none" stroke="#f00" '
+                       f'stroke-width="2"/>')
+        return ''.join(out)
+
     ov = [f'<svg xmlns="http://www.w3.org/2000/svg" '
           f'width="{fmt(total_w)}mm" height="{fmt(total_h)}mm" '
           f'viewBox="0 0 {fmt(total_w)} {fmt(total_h)}" version="1.0">']
-    full = []
-    for poly in grid_polys:
-        full.append('M' + fmt(poly[0][0]) + ' ' + fmt(poly[0][1]) + 'L'
-                     + ' '.join(f'{fmt(q[0])} {fmt(q[1])}' for q in poly[1:]) + 'Z')
-    ov.append(f'<path fill="{fill}" fill-rule="nonzero" d="{"".join(full)}"/>')
+    ov.append(f'<path fill="{fill}" fill-rule="evenodd" d="{geom_d(land, 0, 0)}"/>')
+    ov.append(f'<rect x="0" y="0" width="{fmt(total_w)}" height="{fmt(total_h)}" '
+              f'fill="none" stroke="#f00" stroke-width="2"/>')   # outer sheet edges
+    for seam in seam_lines:                    # interior seams, gapped at kept islands
+        ov.append(line_svg(seam.difference(moved) if moved is not None else seam))
+    if moved is not None:                      # detour: island coastline = the real cut
+        ov.append(line_svg(moved.boundary.difference(all_seams)))
     for r in range(rows):
         for c in range(cols):
-            ov.append(f'<rect x="{fmt(c*pw)}" y="{fmt(r*ph)}" width="{fmt(pw)}" '
-                      f'height="{fmt(ph)}" fill="none" stroke="#f00" '
-                      f'stroke-width="2"/>')
             ov.append(f'<text x="{fmt(c*pw+20)}" y="{fmt(r*ph+50)}" '
                       f'font-size="40" fill="#00f">r{r+1}c{c+1}</text>')
     ov.append('</svg>')
