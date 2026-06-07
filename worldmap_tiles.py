@@ -101,6 +101,12 @@ def main():
     ap.add_argument('--piece-height-cm', type=float, default=60.0)
     ap.add_argument('--margin-mm', type=float, default=0.0,
                     help='blank margin kept around the whole map inside the grid')
+    ap.add_argument('--scale', type=float, default=1.0,
+                    help='0-1 fraction of the max fit-to-grid scale (1 = as large '
+                         'as fits)')
+    ap.add_argument('--align-horizontal', type=float, default=0.5,
+                    help='0-1 horizontal placement of the map in spare width '
+                         '(0 = flush left, 1 = flush right, 0.5 = centred)')
     ap.add_argument('--border', action='store_true',
                     help='draw each piece outline rectangle (cut/registration)')
     ap.add_argument('--label', action='store_true',
@@ -109,6 +115,10 @@ def main():
 
     if args.pieces < 1:
         sys.exit('--pieces must be >= 1')
+    if not 0 < args.scale <= 1:
+        sys.exit('--scale must be in (0, 1]')
+    if not 0 <= args.align_horizontal <= 1:
+        sys.exit('--align-horizontal must be in [0, 1]')
 
     svg = open(args.input, encoding='utf-8').read()
     dm = re.search(r'\bd="([^"]+)"', svg)
@@ -130,12 +140,14 @@ def main():
     cols, rows, pw, ph = choose_grid(args.pieces, pw, ph, map_aspect)
     total_w, total_h = cols * pw, rows * ph
 
-    # fit map into the usable area (grid minus margin), preserving aspect
+    # fit map into the usable area (grid minus margin), preserving aspect, then
+    # shrink by --scale and place horizontally by --align-horizontal
     avail_w, avail_h = total_w - 2 * args.margin_mm, total_h - 2 * args.margin_mm
-    scale = min(avail_w / map_w, avail_h / map_h)
+    scale = min(avail_w / map_w, avail_h / map_h) * args.scale
     draw_w, draw_h = map_w * scale, map_h * scale
-    off_x = (total_w - draw_w) / 2.0          # map origin in grid-mm space
-    off_y = (total_h - draw_h) / 2.0
+    # spare width gets distributed left/right by align (0 = left, 1 = right)
+    off_x = args.margin_mm + args.align_horizontal * max(0.0, avail_w - draw_w)
+    off_y = (total_h - draw_h) / 2.0          # vertical: always centred
 
     def to_grid(p):                            # source px -> grid mm
         return ((p[:, 0] - mnx) * scale + off_x,
